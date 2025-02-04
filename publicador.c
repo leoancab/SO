@@ -1,148 +1,187 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <semaphore.h>
-#include <errno.h>
+#include <sys/wait.h>
 #include <string.h>
+#include "bmp.h"
 
-#define SHM_NAME "/imagen_shm"
-#define SEM_NAME "/sem_imagen"
+// Constantes para acceso compartido
+#define SHM_NAME "/shared"
+#define SEM_NAME "/sem"
 
-// Estructuras BMP (como definidas antes, para manejar las imágenes)
-#pragma pack(push, 1)
-typedef struct {
-    unsigned short bfType;
-    unsigned int bfSize;
-    unsigned short bfReserved1;
-    unsigned short bfReserved2;
-    unsigned int bfOffBits;
-} BMPHeader;
-
-typedef struct {
-    unsigned int biSize;
-    int biWidth;
-    int biHeight;
-    unsigned short biPlanes;
-    unsigned short biBitCount;
-    unsigned int biCompression;
-    unsigned int biSizeImage;
-    int biXPelsPerMeter;
-    int biYPelsPerMeter;
-    unsigned int biClrUsed;
-    unsigned int biClrImportant;
-} BMPInfoHeader;
-#pragma pack(pop)
-
-typedef struct {
-    BMPHeader header;
-    BMPInfoHeader infoHeader;
-    unsigned char *data; // Píxeles de la imagen
-} BMPImage;
-
-int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        printf("Uso: %s <ruta_de_guardado>\n", argv[0]);
-        exit(EXIT_FAILURE);
+// ./publicador <imagen_origen> <titulo_salida> <numero_de_threads>
+int main(int argc, char **argv)
+{
+    if (argc != 4)
+    {
+        printf("Uso: %s <imagen_origen> <salida> <numero_de_threads>\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    const char *output_path = argv[1]; // Ruta para guardar la imagen final
+    FILE *origen;
+    FILE *salida;
+    BMP_Image *imagen_origen = (BMP_Image *)malloc(sizeof(BMP_Image));
+    BMP_Image *imagen_salida = (BMP_Image *)malloc(sizeof(BMP_Image));
 
-    // Abre el archivo de memoria compartida
+    /*Proceso para cargar imagen BMP en memoria*/
+    if ((origen = fopen(argv[1], "rb")) == NULL)
+    {
+        printError(FILE_ERROR);
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+        return EXIT_FAILURE;
+    }
+
+    if ((salida = fopen(argv[2], "wb")) == NULL)
+    {
+        printError(FILE_ERROR);
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+        return EXIT_FAILURE;
+    }
+
+    int num_threads = atoi(argv[3]);
+    if (num_threads <= 0)
+    {
+        printf("Número de hilos inválido\n");
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+    }
+
+    readImage(origen, imagen_origen);
+    if (!checkBMPValid(&imagen_origen->header))
+    {
+        printError(VALID_ERROR);
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+        return EXIT_FAILURE;
+    }
+
+    printBMPHeader(&imagen_origen->header);
+    printBMPImage(imagen_origen);
+    fclose(origen);
+    /*Fin proceso de carga imagen BMP en memoria*/
+
+    // Tamaño de la imagen (Igual que en pa3)
+    size_t image_size = sizeof(BMP_Header) + (imagen_origen->norm_height * imagen_origen->header.width_px * sizeof(Pixel));
+
+    // Crear Memoria compartida
     int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
-    if (shm_fd == -1) {
-        perror("Error al abrir la memoria compartida");
-        exit(EXIT_FAILURE);
+    if (shm_fd == -1)
+    {
+        printf("Error al crear memoria compartida1\n");
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+        close(shm_fd);
+        shm_unlink(SHM_NAME);
+        return EXIT_FAILURE;
     }
 
-    // Definir el tamaño de la imagen (esto debe coincidir con el tamaño de la imagen real)
-    size_t image_size = sizeof(BMPImage); // Ajustar esto según el tamaño de la imagen
-
-    // Configurar el tamaño de la memoria compartida
-    if (ftruncate(shm_fd, image_size) == -1) {
-        perror("Error al configurar el tamaño de la memoria compartida");
-        exit(EXIT_FAILURE);
+    // Ajustar tamaño de memoria compartida
+    if (ftruncate(shm_fd, image_size) == -1)
+    {
+        perror("Error al configurar tamaño de memoria compartida");
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+        close(shm_fd);
+        shm_unlink(SHM_NAME);
+        return EXIT_FAILURE;
     }
 
-    // Mapear la memoria compartida
-    BMPImage *imagen = (BMPImage *)mmap(NULL, image_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (imagen == MAP_FAILED) {
-        perror("Error al mapear la memoria compartida");
-        exit(EXIT_FAILURE);
+    // Ajustar tamaño de la memoria compartida
+    void *shm_ptr = mmap(NULL, image_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED)
+    {
+        printf("Error al mapear memoria compartida2\n");
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+        close(shm_fd);
+        shm_unlink(SHM_NAME);
+        return EXIT_FAILURE;
     }
 
-    // Inicializar el semáforo
-    sem_t *sem = sem_open(SEM_NAME, O_CREAT, 0644, 1);
-    if (sem == SEM_FAILED) {
+    // Copiar la imagen a la memoria compartida
+    // memcpy(shm_ptr, &imagen_origen->header, sizeof(BMP_Header));
+    // memcpy(shm_ptr + sizeof(BMP_Header), imagen_origen->pixels, imagen_origen->norm_height * imagen_origen->header.width_px * sizeof(Pixel));
+
+    memcpy(shm_ptr, &imagen_origen->header, sizeof(BMP_Header));
+
+    Pixel *shm_pixels = (Pixel *)(shm_ptr + sizeof(BMP_Header));
+
+    for (int i = 0; i < imagen_origen->norm_height; i++)
+    {
+        memcpy(shm_pixels + (i * imagen_origen->header.width_px),
+               imagen_origen->pixels[i],
+               imagen_origen->header.width_px * sizeof(Pixel));
+    }
+
+    printf("Imagen cargada en memoria compartida.\n");
+
+    // Crear el semaforo para sincronizar los procesos
+    // Y controlar acceso a memoria compartida
+    sem_t *sem = sem_open(SEM_NAME, O_CREAT, 0644, 0);
+    if (sem == SEM_FAILED)
+    {
         perror("Error al crear semáforo");
-        exit(EXIT_FAILURE);
+        freeImage(imagen_origen);
+        freeImage(imagen_salida);
+        munmap(shm_ptr, image_size);
+        close(shm_fd);
+        shm_unlink(SHM_NAME);
+        return EXIT_FAILURE;
     }
 
-    // Cargar la imagen en la memoria compartida (esto se asume que ya está hecho en el Publicador)
-    // Aquí es donde la imagen se carga en la memoria compartida por el Publicador.
+    // Fin memoria compartida
 
-    // Crear procesos para el Desenfocador y Realzador
-    pid_t pid_des = fork();
-    if (pid_des == 0) {
-        // Proceso hijo - Desenfocador
-        execlp("./desenfocador", "./desenfocador", SEM_NAME, NULL);
-        perror("Error al ejecutar el desenfocador");
-        exit(EXIT_FAILURE);
-    } else if (pid_des < 0) {
-        perror("Error en fork() para desenfocador");
-        exit(EXIT_FAILURE);
+    /*Lanzar los demas procesos*/
+    pid_t pid_desenfocador = fork();
+    if (pid_desenfocador == 0)
+    {
+        execlp("./desenfocador", "./desenfocador", argv[3], NULL);
+        perror("Error al ejecutar el Desenfocador");
+        return EXIT_FAILURE;
     }
 
-    pid_t pid_realz = fork();
-    if (pid_realz == 0) {
-        // Proceso hijo - Realzador
-        execlp("./realzador", "./realzador", SEM_NAME, NULL);
-        perror("Error al ejecutar el realzador");
-        exit(EXIT_FAILURE);
-    } else if (pid_realz < 0) {
-        perror("Error en fork() para realzador");
-        exit(EXIT_FAILURE);
+    pid_t pid_realzador = fork();
+    if (pid_realzador == 0)
+    {
+        execlp("./realzador", "./realzador", argv[3], NULL);
+        perror("Error al ejecutar el Realzador");
+        return EXIT_FAILURE;
     }
 
-    // Esperar a que los procesos hijos terminen
-    waitpid(pid_des, NULL, 0);
-    waitpid(pid_realz, NULL, 0);
+    /*Esperar que los procesos terminen*/
+    waitpid(pid_desenfocador, NULL, 0);
+    waitpid(pid_realzador, NULL, 0);
 
-    // Aquí es donde se realiza la combinación de las dos porciones procesadas
+    printf("Procesamiento completado. Recuperando imagen de la memoria compartida...\n");
 
-    // Combinamos las dos mitades de la imagen procesada
-    int height = imagen->infoHeader.biHeight;
-    int width = imagen->infoHeader.biWidth;
-    int half_height = height / 2;
+    sem_post(sem);
 
-    // Asegurarse de que la imagen fue procesada correctamente
-    // La primera mitad de la imagen ya fue procesada por el Desenfocador
-    // La segunda mitad fue procesada por el Realzador
-    // Ahora se guardan ambas mitades en la misma imagen
-
-    // Ruta y nombre de archivo para guardar la imagen final
-    FILE *output_file = fopen(output_path, "wb");
-    if (!output_file) {
-        perror("Error al abrir el archivo de salida");
-        exit(EXIT_FAILURE);
+    BMP_Image *image_procesada = (BMP_Image *)mmap(NULL, image_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (image_procesada == MAP_FAILED)
+    {
+        perror("Error al mapear memoria compartida para guardar imagen");
+        close(shm_fd);
+        shm_unlink(SHM_NAME);
+        return EXIT_FAILURE;
     }
 
-    // Escribir el encabezado BMP y la información
-    fwrite(&imagen->header, sizeof(BMPHeader), 1, output_file);
-    fwrite(&imagen->infoHeader, sizeof(BMPInfoHeader), 1, output_file);
+    writeImage(salida, image_procesada);
+    fclose(salida);
 
-    // Escribir los datos de la imagen combinada
-    fwrite(imagen->data, imagen->infoHeader.biSizeImage, 1, output_file);
-    fclose(output_file);
-
-    // Desvincular la memoria compartida
-    if (munmap(imagen, image_size) == -1) {
-        perror("Error al desvincular la memoria compartida");
-    }
-
-    close(shm_fd);
-
-    // Cerrar el semáforo
+    // Liberar memoria y recursos
+    freeImage(imagen_origen);
+    freeImage(image_procesada);
     sem_close(sem);
+    sem_unlink(SEM_NAME);
+    munmap(shm_ptr, image_size);
+    close(shm_fd);
+    shm_unlink(SHM_NAME);
+
+    return EXIT_SUCCESS;
+}

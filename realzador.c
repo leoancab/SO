@@ -1,177 +1,85 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
-#include <unistd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
-#include <errno.h>
+#include <unistd.h>
 #include <string.h>
-#include <math.h>
+#include <pthread.h>
+#include "bmp.h"
+#include "filter.h"
 
-// Estructuras para leer el encabezado de la imagen BMP
-#pragma pack(push, 1)
-typedef struct {
-    unsigned short bfType;         // Tipo de archivo
-    unsigned int bfSize;           // Tamaño del archivo
-    unsigned short bfReserved1;
-    unsigned short bfReserved2;
-    unsigned int bfOffBits;        // Desplazamiento hasta los datos de la imagen
-} BMPHeader;
+#define SHM_NAME "/shared"
 
-typedef struct {
-    unsigned int biSize;           // Tamaño de la estructura
-    int biWidth;                   // Ancho de la imagen
-    int biHeight;                  // Alto de la imagen
-    unsigned short biPlanes;       // Número de planos de color
-    unsigned short biBitCount;     // Número de bits por píxel
-    unsigned int biCompression;    // Tipo de compresión
-    unsigned int biSizeImage;      // Tamaño de la imagen
-    int biXPelsPerMeter;           // Resolución horizontal
-    int biYPelsPerMeter;           // Resolución vertical
-    unsigned int biClrUsed;        // Número de colores utilizados
-    unsigned int biClrImportant;   // Colores importantes
-} BMPInfoHeader;
-#pragma pack(pop)
-
-typedef struct {
-    BMPHeader header;
-    BMPInfoHeader infoHeader;
-    unsigned char *data; // Píxeles de la imagen
-} BMPImage;
-
-// Estructura para pasar información a los hilos
-typedef struct {
-    BMPImage *imagen;
-    int start_row;
-    int end_row;
-} ThreadData;
-
-// Filtros Sobel para detección de bordes
-int kernelX[3][3] = {
-    {-1, 0, 1},
-    {-2, 0, 2},
-    {-1, 0, 1}
-};
-
-int kernelY[3][3] = {
-    {-1, -2, -1},
-    {0, 0, 0},
-    {1, 2, 1}
-};
-
-// Función para aplicar el filtro Sobel y detectar bordes
-void aplicar_realce_de_bordes(BMPImage *imagen, int x, int y) {
-    int width = imagen->infoHeader.biWidth;
-    int height = imagen->infoHeader.biHeight;
-
-    if (x <= 0 || x >= width - 1 || y <= 0 || y >= height - 1) {
-        return; // Evitar bordes de la imagen
+int main(int argc, char **argv)
+{
+    if (argc != 2)
+    {
+        printf("Uso: %s <numero_de_threads>\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    int Gx = 0, Gy = 0;
-
-    // Aplicar el filtro Sobel en X y Y
-    for (int i = -1; i <= 1; i++) {
-        for (int j = -1; j <= 1; j++) {
-            int nx = x + i;
-            int ny = y + j;
-            int idx = (ny * width + nx) * 3;
-            Gx += imagen->data[idx] * kernelX[i + 1][j + 1];
-            Gy += imagen->data[idx] * kernelY[i + 1][j + 1];
-        }
+    int numThreads = atoi(argv[1]);
+    if (numThreads <= 0)
+    {
+        printf("Número de hilos inválido.\n");
+        return EXIT_FAILURE;
     }
 
-    // Calcular la magnitud del borde
-    int mag = (int)sqrt(Gx * Gx + Gy * Gy);
-
-    // Asignar el valor del borde (realce) al píxel
-    int idx = (y * width + x) * 3;
-    unsigned char val = (mag > 255) ? 255 : (unsigned char)mag;
-    imagen->data[idx] = val; // Reducción a un solo canal (gris)
-    imagen->data[idx + 1] = val;
-    imagen->data[idx + 2] = val;
-}
-
-// Función que ejecutará cada hilo para realzar bordes en una parte de la imagen
-void* realzar_parte(void* arg) {
-    ThreadData *data = (ThreadData *)arg;
-    BMPImage *imagen = data->imagen;
-    int start_row = data->start_row;
-    int end_row = data->end_row;
-    int width = imagen->infoHeader.biWidth;
-
-    // Aplicar el realce de bordes a la segunda mitad de la imagen (especificado por las filas)
-    for (int y = start_row; y < end_row; y++) {
-        for (int x = 0; x < width; x++) {
-            aplicar_realce_de_bordes(imagen, x, y);
-        }
+    // Acceder a memoria compartida
+    int shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
+    if (shm_fd == -1)
+    {
+        perror("Error al abrir memoria compartida");
+        return EXIT_FAILURE;
     }
 
-    return NULL;
-}
+    // BMP_Header header;
+    // read(shm_fd, &header, sizeof(BMP_Header));
+    // size_t image_size = sizeof(BMP_Header) + (header.height_px * header.width_px * sizeof(Pixel));
+    // size_t image_size = sizeof(BMP_Header) + (image->header.width_px * abs(image->header.height_px) * image->bytes_per_pixel);
+    // size_t image_size = sizeof(BMP_Header) + (header.width_px * abs(header.height_px) * sizeof(Pixel));
+    // printf("Tamaño de memoria compartida configurado: %zu bytes\n", image_size);
 
-int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        printf("Uso: %s <num_hilos>\n", argv[0]);
-        exit(EXIT_FAILURE);
+    // Mapear memoria compartida
+    BMP_Image *image = (BMP_Image *)mmap(NULL, sizeof(BMP_Image), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (image == MAP_FAILED)
+    {
+        printf("Error al mapear memoria2\n");
+        close(shm_fd);
+        return EXIT_FAILURE;
     }
 
-    int num_hilos = atoi(argv[1]);
+    size_t image_size = sizeof(BMP_Header) + (image->header.width_px * abs(image->header.height_px) * sizeof(Pixel));
+    printf("Tamaño de memoria compartida configurado: %zu bytes\n", image_size);
 
-    const char *shm_name = "/imagen_shm";
-    int shm_fd;
-    BMPImage *imagen;
+    munmap(image, sizeof(BMP_Image));
+    // image = (BMP_Image*)mmap(NULL, image_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    // if (image == MAP_FAILED) {
+    //     perror("Error al mapear memoria compartida correctamente");
+    //     close(shm_fd);
+    //     return EXIT_FAILURE;
+    // }
 
-    // Abrir la memoria compartida
-    shm_fd = shm_open(shm_name, O_RDONLY, 0666);
-    if (shm_fd == -1) {
-        perror("Error al abrir la memoria compartida");
-        exit(EXIT_FAILURE);
+    image->pixels = (Pixel **)malloc(image->norm_height * sizeof(Pixel *));
+    Pixel *shm_pixels = (Pixel *)(image + sizeof(BMP_Header));
+
+    for (int i = 0; i < image->norm_height; i++)
+    {
+        image->pixels[i] = shm_pixels + (i * image->header.width_px);
     }
 
-    // Mapear la memoria compartida
-    imagen = (BMPImage *)mmap(NULL, sizeof(BMPImage), PROT_READ, MAP_SHARED, shm_fd, 0);
-    if (imagen == MAP_FAILED) {
-        perror("Error al mapear la memoria compartida");
-        exit(EXIT_FAILURE);
-    }
+    image->norm_height = abs(image->header.height_px);
+    image->bytes_per_pixel = image->header.bits_per_pixel / 8; // 32 bits por pixel => 4 bytes
 
-    int height = imagen->infoHeader.biHeight;
-    int rows_per_thread = height / 2 / num_hilos; // Dividir la mitad inferior de la imagen entre los hilos
+    printf("-----------------------Realzador\n");
+    printf("Width: %d, Height: %d, Bits per pixel: %d\n", image->header.width_px, image->header.height_px, image->header.bits_per_pixel);
+    printBMPImage(image);
 
-    pthread_t threads[num_hilos];
-    ThreadData thread_data[num_hilos];
+    applyParallel(image, image, (int[3][3]){{-1, -1, -1}, {-1, 8, -1}, {-1, -1, -1}}, numThreads, false);
 
-    // Crear los hilos para realzar los bordes en la segunda mitad de la imagen
-    for (int i = 0; i < num_hilos; i++) {
-        thread_data[i].imagen = imagen;
-        thread_data[i].start_row = (height / 2) + (i * rows_per_thread);
-        thread_data[i].end_row = (i == num_hilos - 1) ? height : (height / 2) + ((i + 1) * rows_per_thread);
-        pthread_create(&threads[i], NULL, realzar_parte, &thread_data[i]);
-    }
-
-    // Esperar a que todos los hilos terminen
-    for (int i = 0; i < num_hilos; i++) {
-        pthread_join(threads[i], NULL);
-    }
-
-    // Guardar la imagen realzada en un nuevo archivo BMP
-    FILE *salida = fopen("imagen_realzada.bmp", "wb");
-    if (!salida) {
-        perror("Error al guardar la imagen");
-        exit(EXIT_FAILURE);
-    }
-    fwrite(&imagen->header, sizeof(BMPHeader), 1, salida);
-    fwrite(&imagen->infoHeader, sizeof(BMPInfoHeader), 1, salida);
-    fwrite(imagen->data, imagen->infoHeader.biSizeImage, 1, salida);
-    fclose(salida);
-
-    // Desvincular y cerrar la memoria compartida
-    if (munmap(imagen, sizeof(BMPImage)) == -1) {
-        perror("Error al desvincular la memoria compartida");
-    }
-
+    // Desvincular la memoria compartida
     close(shm_fd);
 
-    return 0;
+    printf("Realzador: Filtro aplicado correctamente a la mitad inferior.\n");
+    return EXIT_SUCCESS;
 }
